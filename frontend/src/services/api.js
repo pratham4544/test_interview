@@ -2,7 +2,9 @@
 // Removed: Speech recognition, monitoring, audio recording endpoints
 // Frontend now handles all audio/video functionality
 
-const API_BASE = process.env.REACT_APP_API_BASE || 'http://ai-interviewer-v1.duckdns.org';
+// const API_BASE = process.env.REACT_APP_API_BASE || 'http://ai-interviewer-v1.duckdns.org' || 'http://localhost:8000';
+
+const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:8000';
 
 class ApiService {
   constructor() {

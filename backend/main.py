@@ -116,7 +116,8 @@ async def setup_interview(request: InterviewSetupRequest):
             logger.info(f"Generating new interview for candidate {request.candidate_id}")
             response, questions, greeting = generate_questions(candidate_data)
             store_interview_template(candidate_data, greeting, questions)
-        
+            print(f"interview Questions is: {questions} ")
+            
         return InterviewSetupResponse(
             candidate_id=request.candidate_id,
             greeting=greeting,
@@ -136,15 +137,36 @@ async def submit_answer(request: AnswerSubmissionRequest):
     """Submit and evaluate an answer"""
     try:
         evaluation = evaluate_answer(request.question, request.answer)
+        print("answer given is :",request.answer)
+        score = evaluation["evaluation"]["score"]
         
-        needs_followup = evaluation["evaluation"]["score"] < 7
+        # Get or initialize follow-up counter for this question
+        question_key = hash(request.question)  # Simple hash for tracking
+        if not hasattr(app.state, 'followup_counts'):
+            app.state.followup_counts = {}
+        
+        current_followup_count = app.state.followup_counts.get(question_key, 0)
+        MAX_FOLLOWUPS = 2  # Maximum 2 follow-ups per question
+        
+        # Determine if follow-up is needed
+        needs_followup = (score < 4) and (current_followup_count < MAX_FOLLOWUPS)
         follow_up_question = None
         
         if needs_followup:
             follow_up_question = generate_follow_up_question(request.question, request.answer)
+            print("Requested Answer is :",request.answer)
+            app.state.followup_counts[question_key] = current_followup_count + 1
+            logger.info(f"✅ Generated follow-up question ({current_followup_count + 1}/{MAX_FOLLOWUPS}): {follow_up_question}")
+            print("Follow up question is :",follow_up_question)
+        else:
+            # Reset counter when moving to next question
+            if question_key in app.state.followup_counts:
+                del app.state.followup_counts[question_key]
+            if score < 4:
+                logger.info(f"⚠️ Max follow-ups reached. Moving to next question despite low score ({score}/10)")
         
         return AnswerEvaluationResponse(
-            score=evaluation["evaluation"]["score"],
+            score=score,
             feedback=evaluation["evaluation"]["feedback"],
             needs_followup=needs_followup,
             follow_up_question=follow_up_question
@@ -152,21 +174,8 @@ async def submit_answer(request: AnswerSubmissionRequest):
     except Exception as e:
         logger.error(f"Answer evaluation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/answer/follow-up")
-async def submit_follow_up_answer(request: FollowUpRequest):
-    """Submit follow-up answer"""
-    try:
-        evaluation = evaluate_answer(request.follow_up_question, request.follow_up_answer)
-        return {
-            "score": evaluation["evaluation"]["score"],
-            "feedback": evaluation["evaluation"]["feedback"],
-            "follow_up_level": request.follow_up_level
-        }
-    except Exception as e:
-        logger.error(f"Follow-up evaluation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+    
+    
 # =========================
 # INTERVIEW DATA STORAGE ENDPOINTS
 # =========================

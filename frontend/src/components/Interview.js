@@ -1,4 +1,4 @@
-// frontend/src/components/Interview.js - Complete Enhanced Version with Fixed Logic
+// frontend/src/components/Interview.js - FIXED VERSION with Proper State Management
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import useInterview from '../hooks/useInterview';
 import apiService from '../services/api';
@@ -57,8 +57,9 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
   const [videoStream, setVideoStream] = useState(null);
   const [scoreThreshold, setScoreThreshold] = useState(threshold);
 
-  // **CRITICAL FIX: Track follow-up counter per question**
+  // **CRITICAL FIX: Track follow-up counter AND prevent re-submission during transition**
   const followUpCounterRef = useRef(0);
+  const isTransitioningRef = useRef(false); // NEW: Prevent submissions during state transitions
 
   // Enhanced data capture with complete storage
   const [capturedData, setCapturedData] = useState({
@@ -89,8 +90,23 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
   // Save to localStorage whenever data changes
   useEffect(() => {
     const storageKey = `interview_data_${candidateId}`;
-    localStorage.setItem(storageKey, JSON.stringify(capturedData));
-  }, [capturedData, candidateId]);
+    try {
+      // Only save essential data - avoid localStorage quota issues
+      const essentialData = {
+        candidateId: capturedData.candidateId,
+        startTime: capturedData.startTime,
+        currentQuestion,
+        interactions: capturedData.interactions.slice(-5), // Last 5 interactions only
+        totalQuestions: capturedData.totalQuestions
+      };
+      localStorage.setItem(storageKey, JSON.stringify(essentialData));
+    } catch (error) {
+      if (error.name === 'QuotaExceededError') {
+        console.warn('⚠️ Storage quota exceeded, clearing old data');
+        localStorage.clear();
+      }
+    }
+  }, [capturedData, candidateId, currentQuestion]);
 
   // Initialize camera
   useEffect(() => {
@@ -232,7 +248,7 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
         const timestamp = new Date().toISOString();
         setCapturedData(prev => ({
           ...prev,
-          screenshots: [...prev.screenshots, {
+          screenshots: [...prev.screenshots.slice(-10), { // Keep only last 10 screenshots
             timestamp,
             data: screenshot,
             questionIndex: currentQuestion
@@ -245,239 +261,118 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
     screenshotIntervalRef.current = setInterval(captureAndStore, 30000);
   }, [captureScreenshot, currentQuestion]);
 
-  // Start audio recording
-  const startAudioRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
-      
-      audioChunksRef.current = [];
-      
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-      
-      mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const timestamp = new Date().toISOString();
-        
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          setCapturedData(prev => ({
-            ...prev,
-            audioRecordings: [...prev.audioRecordings, {
-              timestamp,
-              data: reader.result,
-              questionIndex: currentQuestion,
-              duration: recordingTime
-            }]
-          }));
-        };
-        reader.readAsDataURL(audioBlob);
-        
-        stream.getTracks().forEach(track => track.stop());
-      };
-      
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start();
-    } catch (error) {
-      console.error('Audio recording failed:', error);
-    }
-  }, [currentQuestion, recordingTime]);
-
-  const stopAudioRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.stop();
-    }
-  }, []);
-
-  // TTS
-  const speakText = async (text, shouldAutoStart = true) => {
+  // TTS function
+  const speakText = useCallback(async (text, isQuestion = false) => {
     try {
       setIsSpeaking(true);
-      setVoiceState(VOICE_STATES.SPEAKING);
-
-      const ttsResult = await apiService.getTextToSpeech(text, candidateId);
+      console.log(`🗣️ Speaking: ${text.substring(0, 50)}...`);
       
-      if (ttsResult.success && ttsResult.audio_base64) {
-        await audioService.playAudioFromBase64(ttsResult.audio_base64);
+      const audioData = await apiService.requestTTS(text, candidateId, isQuestion ? 'pre-generated' : 'runtime');
+      
+      if (audioData && audioData.audio_base64) {
+        const audio = new Audio(`data:audio/mp3;base64,${audioData.audio_base64}`);
+        
+        audio.onended = () => {
+          setIsSpeaking(false);
+          console.log('✅ Speech completed');
+        };
+        
+        audio.onerror = () => {
+          setIsSpeaking(false);
+          console.error('❌ Audio playback failed');
+        };
+        
+        await audio.play();
       }
     } catch (error) {
-      console.error('TTS failed:', error);
-    } finally {
+      console.error('TTS Error:', error);
       setIsSpeaking(false);
-      setVoiceState(VOICE_STATES.IDLE);
-      
-      if (autoMode && !isRecording && shouldAutoStart) {
-        setTimeout(() => {
-          startListening();
-        }, 500);
-      }
     }
-  };
+  }, [candidateId]);
 
-  // Voice Recognition with transcription storage
-  const startListening = async () => {
+  // Start listening function
+  const startListening = useCallback(async () => {
+    if (!autoMode || isListening || isSpeaking) return;
+
     try {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      
-      if (!SpeechRecognition) {
-        alert('Speech recognition is not supported in your browser. Please use Chrome or Edge.');
-        return;
-      }
-
       setIsListening(true);
       setIsRecording(true);
-      setVoiceState(VOICE_STATES.LISTENING);
-      setRecordingTime(0);
       
-      isProcessingSubmission.current = false;
-      
-      await startAudioRecording();
-      
-      recordingTimer.current = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
-      }, 1000);
-      
-      const recognition = new SpeechRecognition();
-      recognitionRef.current = recognition;
-      
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-      
-      let finalTranscript = '';
-      let lastSpeechTime = Date.now();
-      let silenceTimer = null;
-      
-      recognition.onresult = (event) => {
-        let interimTranscript = '';
-        finalTranscript = '';
+      if ('webkitSpeechRecognition' in window) {
+        const recognition = new window.webkitSpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
         
-        for (let i = 0; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript + ' ';
-          } else {
-            interimTranscript += transcript;
-          }
-        }
+        let finalTranscript = '';
+        lastSpeechTimeRef.current = Date.now();
         
-        const fullTranscript = (finalTranscript + interimTranscript).trim();
-        
-        if (fullTranscript) {
-          transcriptBackup.current = fullTranscript;
+        recognition.onresult = (event) => {
+          let interimTranscript = '';
           
-          // Store transcription in real-time
-          setCapturedData(prev => ({
-            ...prev,
-            transcriptions: [...prev.transcriptions.filter(t => t.questionIndex !== currentQuestion || t.isFinal), {
-              timestamp: new Date().toISOString(),
-              questionIndex: currentQuestion,
-              text: fullTranscript,
-              isFinal: event.results[event.results.length - 1].isFinal,
-              isFollowUp: showFollowUp
-            }]
-          }));
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              finalTranscript += transcript + ' ';
+            } else {
+              interimTranscript += transcript;
+            }
+          }
+          
+          const fullText = finalTranscript + interimTranscript;
           
           if (showFollowUp) {
-            setFollowUpAnswer(fullTranscript);
+            setFollowUpAnswer(fullText);
           } else {
-            setAnswer(fullTranscript);
+            setAnswer(fullText);
           }
           
-          lastSpeechTime = Date.now();
-          lastSpeechTimeRef.current = lastSpeechTime;
+          transcriptBackup.current = fullText;
+          lastSpeechTimeRef.current = Date.now();
           
-          if (silenceTimer) {
-            clearTimeout(silenceTimer);
-          }
-          
-          if (autoMode && !isProcessingSubmission.current && fullTranscript.length >= 10) {
-            silenceTimer = setTimeout(() => {
-              const timeSinceSpeech = Date.now() - lastSpeechTimeRef.current;
-              if (timeSinceSpeech >= 3000 && !isProcessingSubmission.current) {
-                stopListening();
-              }
-            }, 3000);
-          }
-        }
-      };
-      
-      recognition.onerror = (event) => {
-        console.error('Speech recognition error:', event.error);
-        
-        if (event.error === 'aborted') {
-          return;
-        }
-        
-        if (event.error === 'network') {
-          setTimeout(() => {
-            if (!isProcessingSubmission.current && recognitionRef.current) {
-              try {
-                recognitionRef.current.start();
-              } catch (e) {
-                console.error('Retry failed:', e);
-              }
+          // Auto-submit after 3 seconds of silence
+          clearTimeout(speechTimeout.current);
+          speechTimeout.current = setTimeout(() => {
+            const timeSinceLastSpeech = Date.now() - lastSpeechTimeRef.current;
+            if (timeSinceLastSpeech >= 3000 && fullText.trim().length > 0) {
+              console.log('🤖 Auto-submitting after 3s silence');
+              recognition.stop();
+              handleAutoSubmit();
             }
-          }, 1000);
-          return;
-        }
+          }, 3000);
+        };
         
-        if (event.error !== 'no-speech') {
-          setVoiceState(VOICE_STATES.ERROR);
-        }
-      };
-      
-      recognition.onend = () => {
-        setIsListening(false);
-        setIsRecording(false);
-        setVoiceState(VOICE_STATES.IDLE);
+        recognition.onerror = (event) => {
+          console.error('Recognition error:', event.error);
+          setIsListening(false);
+          setIsRecording(false);
+        };
         
-        stopAudioRecording();
+        recognition.onend = () => {
+          setIsListening(false);
+          setIsRecording(false);
+        };
         
-        if (recordingTimer.current) {
-          clearInterval(recordingTimer.current);
-        }
-        
-        if (!isProcessingSubmission.current && transcriptBackup.current.length >= 10) {
-          handleAutoSubmit();
-        }
-      };
-      
-      recognition.start();
-      
+        recognitionRef.current = recognition;
+        recognition.start();
+      }
     } catch (error) {
-      console.error('Speech recognition failed:', error);
-      setVoiceState(VOICE_STATES.ERROR);
+      console.error('Failed to start listening:', error);
       setIsListening(false);
       setIsRecording(false);
     }
-  };
+  }, [autoMode, isListening, isSpeaking, showFollowUp, setAnswer, setFollowUpAnswer]);
 
-  const stopListening = () => {
+  // Stop listening function
+  const stopListening = useCallback(() => {
     if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        console.error('Error stopping recognition:', e);
-      }
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
     }
-    
-    stopAudioRecording();
-    
-    if (recordingTimer.current) {
-      clearInterval(recordingTimer.current);
-    }
-    
     setIsListening(false);
     setIsRecording(false);
-    setVoiceState(VOICE_STATES.IDLE);
-  };
+    clearTimeout(speechTimeout.current);
+  }, []);
 
   // Store interaction with dynamic threshold logic
   const storeInteraction = useCallback((questionText, answerText, scoreValue, feedbackValue) => {
@@ -500,17 +395,44 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
     }));
   }, [currentQuestion, showFollowUp, scoreThreshold]);
 
-  // **FIXED: Main Answer Handler with Correct Logic**
+  // **CRITICAL FIX: Main Answer Handler with Proper State Management**
   const handleSubmitAnswer = useCallback(async () => {
+    // Prevent submission during transitions
+    if (isTransitioningRef.current) {
+      console.log('⏸️ Skipping submission - transitioning between questions');
+      return;
+    }
+
     try {
       const currentAnswerValue = answer || transcriptBackup.current;
       
+      console.log('🔍 FRONTEND DEBUG - About to submit main answer:', {
+        currentQuestion,
+        questionText: getCurrentQuestionText(),
+        answerLength: currentAnswerValue.length,
+        answerPreview: currentAnswerValue.substring(0, 100) + '...',
+        threshold: scoreThreshold,
+        followUpCounter: followUpCounterRef.current,
+        showFollowUp,
+        isProcessing: isProcessingSubmission.current
+      });
+      
       if (!currentAnswerValue.trim()) {
+        console.log('❌ Empty answer - aborting submission');
         isProcessingSubmission.current = false;
         return;
       }
       
+      console.log('🚀 Calling submitAnswer API...');
       const result = await submitAnswer(currentAnswerValue);
+      
+      console.log('🔍 FRONTEND DEBUG - Backend response received:', {
+        score: result.score,
+        needsFollowup: result.needs_followup,
+        hasFollowUpQuestion: !!result.follow_up_question,
+        currentQuestion,
+        threshold: scoreThreshold
+      });
       
       if (result) {
         storeInteraction(
@@ -527,36 +449,58 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
         // Check if follow-up needed (score below threshold AND less than 2 follow-ups)
         if (result.needs_followup && result.follow_up_question && result.score < scoreThreshold && followUpCounterRef.current < 2) {
           followUpCounterRef.current += 1;
-          console.log(`Follow-up #${followUpCounterRef.current} triggered (score ${result.score} < threshold ${scoreThreshold})`);
+          console.log(`✅ Follow-up #${followUpCounterRef.current} triggered (score ${result.score} < threshold ${scoreThreshold})`);
           
           setTimeout(async () => {
             if (speakQuestions) {
+              console.log('🗣️ Speaking follow-up question...');
               await speakText(result.follow_up_question, true);
             }
           }, 1500);
         } else {
-          console.log(`Moving to next question (score ${result.score} >= ${scoreThreshold} OR max follow-ups reached)`);
+          console.log(`✅ Moving to next question (score ${result.score} >= ${scoreThreshold} OR max follow-ups reached)`);
           followUpCounterRef.current = 0; // RESET counter for next question
-          setTimeout(() => handleNextQuestion(), 1000);
+          
+          setTimeout(() => {
+            console.log(`🔍 Calling handleNextQuestion...`);
+            handleNextQuestion();
+          }, 1000);
         }
       }
     } catch (error) {
-      console.error('Answer submission failed:', error);
+      console.error('❌ Answer submission failed:', error);
     } finally {
       isProcessingSubmission.current = false;
     }
-  }, [answer, submitAnswer, speakQuestions, storeInteraction, getCurrentQuestionText, scoreThreshold]);
+  }, [answer, submitAnswer, speakQuestions, storeInteraction, getCurrentQuestionText, scoreThreshold, currentQuestion]);
 
-  // **FIXED: Follow-up Handler with Correct Logic**
+  // **CRITICAL FIX: Follow-up Handler**
   const handleSubmitFollowUp = useCallback(async () => {
+    // Prevent submission during transitions
+    if (isTransitioningRef.current) {
+      console.log('⏸️ Skipping follow-up submission - transitioning between questions');
+      return;
+    }
+
     try {
       const currentFollowUpValue = followUpAnswer || transcriptBackup.current;
       
+      console.log('🔍 FRONTEND DEBUG - About to submit follow-up answer:', {
+        currentQuestion,
+        followUpQuestionText: followUpQuestion,
+        followUpAnswerLength: currentFollowUpValue.length,
+        followUpAnswerPreview: currentFollowUpValue.substring(0, 100) + '...',
+        threshold: scoreThreshold,
+        followUpCounter: followUpCounterRef.current
+      });
+      
       if (!currentFollowUpValue.trim()) {
+        console.log('❌ Empty follow-up answer - aborting submission');
         isProcessingSubmission.current = false;
         return;
       }
       
+      console.log('🚀 Calling submitFollowUp API...');
       const result = await submitFollowUp(currentFollowUpValue);
       
       if (result) {
@@ -571,10 +515,10 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
         
         console.log(`Follow-up #${followUpCounterRef.current} submitted - Score: ${result.score}, Threshold: ${scoreThreshold}`);
         
-        // Check if another follow-up needed (score below threshold AND haven't done 2 follow-ups yet)
+        // Check if another follow-up needed
         if (result.needs_followup && result.follow_up_question && result.score < scoreThreshold && followUpCounterRef.current < 2) {
           followUpCounterRef.current += 1;
-          console.log(`Follow-up #${followUpCounterRef.current} triggered (score ${result.score} < threshold ${scoreThreshold})`);
+          console.log(`✅ Follow-up #${followUpCounterRef.current} triggered`);
           
           setTimeout(async () => {
             if (speakQuestions) {
@@ -582,26 +526,31 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
             }
           }, 1500);
         } else {
-          console.log(`Moving to next question (score ${result.score} >= ${scoreThreshold} OR completed ${followUpCounterRef.current} follow-ups)`);
-          followUpCounterRef.current = 0; // RESET counter for next question
-          setTimeout(() => handleNextQuestion(), 1000);
+          console.log(`✅ Moving to next question`);
+          followUpCounterRef.current = 0;
+          
+          setTimeout(() => {
+            handleNextQuestion();
+          }, 1000);
         }
       }
     } catch (error) {
-      console.error('Follow-up submission failed:', error);
+      console.error('❌ Follow-up submission failed:', error);
     } finally {
       isProcessingSubmission.current = false;
     }
-  }, [followUpAnswer, submitFollowUp, speakQuestions, followUpQuestion, storeInteraction, scoreThreshold]);
+  }, [followUpAnswer, submitFollowUp, speakQuestions, followUpQuestion, storeInteraction, scoreThreshold, currentQuestion]);
 
   const handleAutoSubmit = useCallback(async () => {
-    if (isProcessingSubmission.current) {
+    if (isProcessingSubmission.current || isTransitioningRef.current) {
+      console.log('⏳ Already processing or transitioning - skipping auto submit');
       return;
     }
     
     isProcessingSubmission.current = true;
     
     try {
+      console.log('🤖 Auto-submit triggered:', { showFollowUp });
       if (showFollowUp) {
         await handleSubmitFollowUp();
       } else {
@@ -612,76 +561,107 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
     }
   }, [showFollowUp, handleSubmitAnswer, handleSubmitFollowUp]);
 
-  const handleNextQuestion = useCallback(async () => {
+  // **CRITICAL FIX: Proper State-Aware Next Question Handler**
+  const handleNextQuestion = useCallback(() => {
+    console.log(`🔍 handleNextQuestion called:`, {
+      currentQuestion,
+      totalQuestions: questions.length,
+      isLast: isLastQuestion(),
+      followUpCounter: followUpCounterRef.current
+    });
+    
+    // Block new submissions during transition
+    isTransitioningRef.current = true;
+    
     if (isLastQuestion()) {
-      await handleCompleteInterview();
-    } else {
-      nextQuestion();
-      
-      if (speakQuestions) {
-        setTimeout(async () => {
-          const nextQuestionText = getCurrentQuestionText();
-          if (nextQuestionText) {
-            await speakText(`Question ${currentQuestion + 2}: ${nextQuestionText}`, true);
-          }
-        }, 1000);
-      } else {
-        if (autoMode) {
-          setTimeout(() => startListening(), 500);
-        }
-      }
+      console.log(`✅ Last question reached - completing interview`);
+      handleCompleteInterview();
+      return;
     }
-  }, [isLastQuestion, nextQuestion, currentQuestion, speakQuestions, autoMode]);
+    
+    // Calculate next question index BEFORE state update
+    const nextQuestionIndex = currentQuestion + 1;
+    console.log(`🔍 Moving from question ${currentQuestion} to ${nextQuestionIndex}`);
+    
+    // Update state
+    nextQuestion();
+    
+    // Use the calculated index, not the state value
+    setTimeout(() => {
+      console.log(`🔍 State updated to question ${nextQuestionIndex}`);
+      
+      // Get the actual question using the calculated index
+      const nextQ = questions[nextQuestionIndex];
+      if (nextQ) {
+        const nextQuestionText = nextQ.question || nextQ;
+        console.log(`🔍 Next question text: ${nextQuestionText.substring(0, 50)}...`);
+        
+        if (speakQuestions) {
+          setTimeout(async () => {
+            await speakText(`Question ${nextQuestionIndex + 1}: ${nextQuestionText}`, true);
+            
+            // Allow submissions again after speaking
+            setTimeout(() => {
+              isTransitioningRef.current = false;
+              
+              if (autoMode) {
+                console.log('🤖 Starting listening for next question...');
+                startListening();
+              }
+            }, 1000);
+          }, 500);
+        } else {
+          isTransitioningRef.current = false;
+          
+          if (autoMode) {
+            setTimeout(() => {
+              startListening();
+            }, 500);
+          }
+        }
+      } else {
+        console.error(`❌ Could not find question at index ${nextQuestionIndex}`);
+        isTransitioningRef.current = false;
+      }
+    }, 200); // Wait for state update
+  }, [currentQuestion, questions, isLastQuestion, nextQuestion, speakQuestions, autoMode, startListening]);
 
-  const handleCompleteInterview = async () => {
+  const handleCompleteInterview = useCallback(async () => {
     try {
+      console.log('🏁 Completing interview...');
+      stopListening();
+      
       if (screenshotIntervalRef.current) {
         clearInterval(screenshotIntervalRef.current);
-      }
-      
-      const result = await completeInterview();
-      
-      if (speakQuestions) {
-        await speakText("Thank you for completing the interview.", false);
       }
       
       const finalData = {
         ...capturedData,
         endTime: new Date().toISOString(),
-        completionResult: result,
-        metadata: {
-          candidateId,
-          threshold: scoreThreshold,
-          completedAt: new Date().toISOString(),
-          totalQuestions: questions.length,
-          totalInteractions: capturedData.interactions.length,
-          totalScreenshots: capturedData.screenshots.length,
-          totalAudioRecordings: capturedData.audioRecordings.length,
-          totalTranscriptions: capturedData.transcriptions.length,
-          passedInteractions: capturedData.interactions.filter(i => i.passedThreshold).length
-        }
+        totalQuestionsAnswered: currentQuestion + 1
       };
       
-      localStorage.setItem('interview_data_' + candidateId, JSON.stringify(finalData));
+      setCapturedData(finalData);
       
-      if (videoStream) {
-        videoStream.getTracks().forEach(track => track.stop());
+      // Save final data
+      const storageKey = `interview_complete_${candidateId}`;
+      localStorage.setItem(storageKey, JSON.stringify(finalData));
+      
+      await completeInterview();
+      
+      if (onComplete) {
+        onComplete(finalData);
       }
-      
-      if (document.exitFullscreen) {
-        await document.exitFullscreen();
-      }
-      
-      onComplete?.(result, finalData);
     } catch (error) {
-      console.error('Interview completion failed:', error);
+      console.error('Error completing interview:', error);
     }
-  };
+  }, [capturedData, currentQuestion, candidateId, stopListening, completeInterview, onComplete]);
 
-  const handleStartInterview = async () => {
+  const handleStartInterview = useCallback(async () => {
     try {
+      console.log('🚀 Starting interview...');
       await startInterview();
-      followUpCounterRef.current = 0; // Initialize counter
+      
       startScreenshotCapture();
       
       if (speakQuestions && interviewSetup?.greeting) {
@@ -691,118 +671,239 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
           const firstQuestion = getCurrentQuestionText();
           if (firstQuestion) {
             await speakText(`Question 1: ${firstQuestion}`, true);
+            
+            if (autoMode) {
+              setTimeout(() => {
+                startListening();
+              }, 1000);
+            }
           }
-        }, 1000);
-      } else {
-        if (autoMode) {
-          setTimeout(() => startListening(), 500);
-        }
+        }, 2000);
       }
     } catch (error) {
       console.error('Failed to start interview:', error);
     }
-  };
+  }, [startInterview, speakQuestions, interviewSetup, autoMode, getCurrentQuestionText, speakText, startListening, startScreenshotCapture]);
 
+  // Setup interview on mount
   useEffect(() => {
     if (candidateId) {
       setupInterview(candidateId);
     }
-    
+  }, [candidateId, setupInterview]);
+
+  // Cleanup on unmount
+  useEffect(() => {
     return () => {
+      stopListening();
       if (screenshotIntervalRef.current) {
         clearInterval(screenshotIntervalRef.current);
       }
-      if (videoStream && !propVideoStream) {
+      if (videoStream) {
         videoStream.getTracks().forEach(track => track.stop());
       }
       cleanup();
     };
-  }, [candidateId]);
+  }, [cleanup, stopListening, videoStream]);
 
+  // Recording timer
   useEffect(() => {
-    if (interviewState === INTERVIEW_STATES.SETUP && interviewSetup) {
-      handleStartInterview();
+    if (isRecording) {
+      setRecordingTime(0);
+      recordingTimer.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+    } else {
+      if (recordingTimer.current) {
+        clearInterval(recordingTimer.current);
+      }
     }
-  }, [interviewState, interviewSetup]);
+    
+    return () => {
+      if (recordingTimer.current) {
+        clearInterval(recordingTimer.current);
+      }
+    };
+  }, [isRecording]);
+
+  if (error) {
+    return (
+      <div style={{
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        color: 'white',
+        fontFamily: 'system-ui, -apple-system, sans-serif'
+      }}>
+        <div style={{
+          background: 'rgba(255, 255, 255, 0.1)',
+          padding: '40px',
+          borderRadius: '20px',
+          textAlign: 'center',
+          backdropFilter: 'blur(10px)'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '20px' }}>❌</div>
+          <div style={{ fontSize: '24px', fontWeight: 'bold', marginBottom: '10px' }}>Error</div>
+          <div style={{ fontSize: '16px', opacity: 0.9 }}>{error}</div>
+          <button
+            onClick={onBack}
+            style={{
+              marginTop: '30px',
+              padding: '12px 30px',
+              background: 'white',
+              color: '#667eea',
+              border: 'none',
+              borderRadius: '8px',
+              fontSize: '16px',
+              fontWeight: '600',
+              cursor: 'pointer'
+            }}
+          >
+            Go Back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (interviewState === INTERVIEW_STATES.NOT_STARTED) {
+    return (
+      <div style={{
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        fontFamily: 'system-ui, -apple-system, sans-serif'
+      }}>
+        <div style={{
+          background: 'white',
+          padding: '60px',
+          borderRadius: '24px',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+          textAlign: 'center',
+          maxWidth: '500px'
+        }}>
+          <div style={{
+            fontSize: '64px',
+            marginBottom: '20px'
+          }}>🎯</div>
+          <h2 style={{
+            fontSize: '32px',
+            fontWeight: 'bold',
+            color: '#1f2937',
+            marginBottom: '15px'
+          }}>Ready to Begin?</h2>
+          <p style={{
+            fontSize: '16px',
+            color: '#6b7280',
+            marginBottom: '30px',
+            lineHeight: '1.6'
+          }}>
+            This AI-powered interview will assess your skills through a series of questions. 
+            Speak clearly and take your time with each answer.
+          </p>
+          <button
+            onClick={handleStartInterview}
+            disabled={loading}
+            style={{
+              width: '100%',
+              padding: '16px',
+              background: loading ? '#9ca3af' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '12px',
+              fontSize: '18px',
+              fontWeight: '600',
+              cursor: loading ? 'not-allowed' : 'pointer',
+              transition: 'transform 0.2s',
+              transform: loading ? 'none' : 'scale(1)'
+            }}
+            onMouseEnter={(e) => !loading && (e.target.style.transform = 'scale(1.02)')}
+            onMouseLeave={(e) => !loading && (e.target.style.transform = 'scale(1)')}
+          >
+            {loading ? 'Loading...' : 'Start Interview'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (interviewState === INTERVIEW_STATES.COMPLETED) {
+    return (
+      <div style={{
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+        fontFamily: 'system-ui, -apple-system, sans-serif'
+      }}>
+        <div style={{
+          background: 'white',
+          padding: '60px',
+          borderRadius: '24px',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+          textAlign: 'center',
+          maxWidth: '500px'
+        }}>
+          <div style={{
+            fontSize: '64px',
+            marginBottom: '20px'
+          }}>✅</div>
+          <h2 style={{
+            fontSize: '32px',
+            fontWeight: 'bold',
+            color: '#1f2937',
+            marginBottom: '15px'
+          }}>Interview Complete!</h2>
+          <p style={{
+            fontSize: '16px',
+            color: '#6b7280',
+            marginBottom: '30px'
+          }}>
+            Thank you for completing the interview. Your responses have been recorded.
+          </p>
+          <button
+            onClick={onComplete}
+            style={{
+              width: '100%',
+              padding: '16px',
+              background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '12px',
+              fontSize: '18px',
+              fontWeight: '600',
+              cursor: 'pointer'
+            }}
+          >
+            View Results
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{
-      width: '100vw',
       height: '100vh',
-      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
       display: 'flex',
       flexDirection: 'column',
+      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+      fontFamily: 'system-ui, -apple-system, sans-serif',
       overflow: 'hidden',
-      userSelect: 'none',
       position: 'relative'
     }}>
+      {/* Hidden canvas for screenshots */}
       <canvas ref={canvasRef} style={{ display: 'none' }} />
-      
-      {/* Progress & Controls Header */}
-      <div style={{
-        background: 'rgba(255, 255, 255, 0.95)',
-        padding: '20px 40px',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        boxShadow: '0 4px 20px rgba(0, 0, 0, 0.1)'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#667eea' }}>
-            AI Interview
-          </div>
-          <div style={{
-            background: '#f3f4f6',
-            padding: '8px 16px',
-            borderRadius: '20px',
-            fontSize: '14px',
-            color: '#6b7280'
-          }}>
-            Question {currentQuestion + 1} / {questions.length}
-          </div>
-        </div>
-        
-        <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
-          <div style={{
-            background: '#e0e7ff',
-            padding: '8px 16px',
-            borderRadius: '20px',
-            fontSize: '14px',
-            color: '#4f46e5',
-            fontWeight: '500'
-          }}>
-            Threshold: {scoreThreshold}
-          </div>
-          {showFollowUp && (
-            <div style={{
-              background: '#fef3c7',
-              padding: '8px 16px',
-              borderRadius: '20px',
-              fontSize: '14px',
-              color: '#92400e',
-              fontWeight: '500'
-            }}>
-              Follow-up {followUpCounterRef.current}/2
-            </div>
-          )}
-          {autoMode && (
-            <div style={{
-              background: '#d1fae5',
-              padding: '8px 16px',
-              borderRadius: '20px',
-              fontSize: '14px',
-              color: '#10b981',
-              fontWeight: '500'
-            }}>
-              Auto-submit ON
-            </div>
-          )}
-        </div>
-      </div>
 
       {/* Progress Bar */}
       <div style={{
-        background: 'rgba(255, 255, 255, 0.3)',
+        width: '100%',
+        background: 'rgba(255, 255, 255, 0.2)',
         height: '6px'
       }}>
         <div style={{
@@ -893,7 +994,7 @@ const Interview = ({ candidateId, onComplete, onBack, videoStream: propVideoStre
           {isRecording && (
             <div style={{
               position: 'absolute',
-bottom: '20px',
+              bottom: '20px',
               left: '50%',
               transform: 'translateX(-50%)',
               background: 'rgba(245, 158, 11, 0.95)',
@@ -939,7 +1040,7 @@ bottom: '20px',
             letterSpacing: '0.5px',
             textTransform: 'uppercase'
           }}>
-            Current Question
+            Question {currentQuestion + 1} of {questions.length}
           </div>
           <div style={{
             fontSize: '20px',
